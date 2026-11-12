@@ -54,7 +54,7 @@ extension SafariParser {
         
         func traverseOriginal(nodes: [[String: Any]], prefix: String, parentId: String?, parentUuid: String?) {
             for node in nodes {
-                let name = node["Title"] as? String ?? ""
+                let name = Self.nodeTitle(in: node) ?? ""
                 if name == "Deleted by BookmarkSync" && parentId == nil {
                     existingDeletedFolder = node
                     continue
@@ -180,7 +180,7 @@ extension SafariParser {
                 } else if node.type == .leaf, let url = node.url {
                     let candidates = cloudKitHelper.urlQueues[normalizeURL(url)] ?? []
                     let titlePreferred = candidates.filter {
-                        (originalNodesByUuid[$0]?["Title"] as? String) == node.title
+                        originalNodesByUuid[$0].flatMap(Self.nodeTitle(in:)) == node.title
                     }
                     matchedUuid = claimFallbackUuid(for: node, candidates: titlePreferred + candidates)
                     if matchedUuid == nil, let fallback = originalMapByUrl[normalizeURL(url)] {
@@ -227,7 +227,7 @@ extension SafariParser {
 
                 if var existing = item.origDict {
                     let sameType = isCompatibleType(existing, with: node.type)
-                    let origTitle = existing["Title"] as? String ?? ""
+                    let origTitle = Self.nodeTitle(in: existing) ?? "Unknown"
                     let sameTitle = origTitle == node.title
                     let sameURL: Bool = {
                         guard node.type == .leaf else { return true }

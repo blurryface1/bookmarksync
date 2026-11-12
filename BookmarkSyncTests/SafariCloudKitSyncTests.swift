@@ -83,7 +83,6 @@ final class SafariCloudKitSyncTests: XCTestCase {
         extra: [String: Any] = [:]
     ) -> [String: Any] {
         var dict: [String: Any] = [
-            "Title": title,
             "URLString": url,
             "URIDictionary": ["title": title],
             "WebBookmarkType": "WebBookmarkTypeLeaf",
@@ -717,5 +716,79 @@ final class SafariCloudKitSyncTests: XCTestCase {
             BookmarkSnapshotFingerprint.compute(readBack),
             BookmarkSnapshotFingerprint.compute(chromeNodes)
         )
+    }
+
+    func testRealSafariLeavesWithoutTopLevelTitleKeyPreserveSyncDataAndPreferredTitleMatch() throws {
+        let url = plistURL()
+        let firstBlob = Data([0xA1])
+        let secondBlob = Data([0xB2])
+        let rootSync: [String: Any] = ["CloudKitMigrationState": 3]
+
+        let root: [String: Any] = [
+            "Children": [
+                folder(
+                    title: "BookmarksBar",
+                    uuid: "BAR",
+                    children: [
+                        folder(
+                            title: "DupSrc",
+                            uuid: "SRC",
+                            children: [
+                                leaf(title: "AlphaTitle", url: "https://dup.example.com", uuid: "U-DUP-ALPHA", sync: ["ServerID": "S-DUP-ALPHA", "Data": firstBlob]),
+                                leaf(title: "BetaTitle", url: "https://dup.example.com", uuid: "U-DUP-BETA", sync: ["ServerID": "S-DUP-BETA", "Data": secondBlob]),
+                            ],
+                            sync: ["ServerID": "S-SRC", "Data": firstBlob]
+                        ),
+                        folder(title: "Target", uuid: "TGT", children: [], sync: ["ServerID": "S-TGT", "Data": secondBlob]),
+                    ]
+                ),
+                folder(title: "BookmarksMenu", uuid: "MENU"),
+                // Real Safari root-level leaf uses URIDictionary.title with no top-level Title key
+                leaf(title: "LooseRootLeaf", url: "https://loose-root.example.com", uuid: "U-LOOSE", sync: ["ServerID": "S-LOOSE", "Data": firstBlob]),
+            ],
+            "Sync": rootSync,
+            "Title": "",
+            "WebBookmarkFileVersion": 1,
+            "WebBookmarkType": "WebBookmarkTypeList",
+            "WebBookmarkUUID": "ROOT",
+        ]
+        let encoded = try PropertyListSerialization.data(fromPropertyList: root, format: .binary, options: 0)
+        try encoded.write(to: url)
+
+        let parser = SafariParser(filePath: url)
+        let before = try parser.read()
+        XCTAssertTrue(before.contains { $0.id == "other:loose-root.example.com" && $0.title == "LooseRootLeaf" })
+
+        // Unchanged write preserves Sync.Data on leaves even when Title key is absent on disk
+        let noChangeReport = try parser.writeWithReport(nodes: before)
+        XCTAssertEqual(noChangeReport.preservedCount, 5)
+        XCTAssertEqual(noChangeReport.invalidatedCount, 0)
+        XCTAssertFalse(noChangeReport.didRequestCloudKitMigration)
+
+        // Moving BetaTitle to Target folder should prefer U-DUP-BETA via URIDictionary.title fallback
+        let updated = before.map { node -> ParsedBookmark in
+            if node.title == "BetaTitle" {
+                return ParsedBookmark(
+                    id: "bookmark_bar:Target:dup.example.com",
+                    title: node.title,
+                    url: node.url,
+                    type: node.type,
+                    parentId: "bookmark_bar:Target",
+                    mtime: node.mtime,
+                    index: 0
+                )
+            }
+            return node
+        }
+        let moveReport = try parser.writeWithReport(nodes: updated)
+        XCTAssertEqual(moveReport.preservedCount, 4)
+        XCTAssertEqual(moveReport.invalidatedCount, 1)
+        XCTAssertTrue(moveReport.didRequestCloudKitMigration)
+
+        let rawRoot = try readRawPlist(url)
+        let bar = childContainer(titled: "BookmarksBar", in: rawRoot)
+        let targetChildren = bar[1]["Children"] as? [[String: Any]] ?? []
+        XCTAssertEqual(targetChildren.first?["WebBookmarkUUID"] as? String, "U-DUP-BETA")
+        XCTAssertEqual((targetChildren.first?["Sync"] as? [String: Any])?["ServerID"] as? String, "S-DUP-BETA")
     }
 }

@@ -121,7 +121,7 @@ struct SafariCloudKitTreeHelper {
 
         func visit(items: [[String: Any]], isRootLevel: Bool) {
             for (index, item) in items.enumerated() {
-                let title = item["Title"] as? String ?? ""
+                let title = SafariParser.nodeTitle(in: item) ?? ""
                 if isRootLevel && Self.ignoredContainerTitles.contains(title) {
                     continue
                 }
