@@ -10,7 +10,18 @@ IDENTITY="$(openssl x509 -in "$CERTIFICATE" -noout -fingerprint -sha1 | cut -d= 
 WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/bookmarksync-signing.XXXXXX")"
 KEYCHAIN_PATH="$WORK_DIR/signing.keychain-db"
 KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+PREV_KEYCHAINS=()
+while IFS= read -r line; do
+    kc="${line#*\"}"
+    kc="${kc%\"*}"
+    if [[ -n "$kc" ]]; then
+        PREV_KEYCHAINS+=("$kc")
+    fi
+done < <(security list-keychains -d user)
 cleanup() {
+    if ((${#PREV_KEYCHAINS[@]} > 0)); then
+        security list-keychains -d user -s "${PREV_KEYCHAINS[@]}" >/dev/null 2>&1 || true
+    fi
     security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
     rm -rf "$WORK_DIR"
 }
@@ -20,8 +31,14 @@ printf '%s' "$MACOS_SIGNING_P12_BASE64" | /usr/bin/base64 --decode > "$WORK_DIR/
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-security import "$WORK_DIR/signing.p12" -k "$KEYCHAIN_PATH" -P "$MACOS_SIGNING_P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+if ((${#PREV_KEYCHAINS[@]} > 0)); then
+    security list-keychains -d user -s "$KEYCHAIN_PATH" "${PREV_KEYCHAINS[@]}"
+else
+    security list-keychains -d user -s "$KEYCHAIN_PATH"
+fi
+security import "$WORK_DIR/signing.p12" -k "$KEYCHAIN_PATH" -P "$MACOS_SIGNING_P12_PASSWORD" -T /usr/bin/codesign -A >/dev/null
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+security find-identity -p codesigning "$KEYCHAIN_PATH"
 codesign --force --deep --timestamp=none --keychain "$KEYCHAIN_PATH" --sign "$IDENTITY" "$APP_PATH"
 codesign --verify --deep --strict "$APP_PATH"
 # Explicitly check that the app is anchored to the committed public certificate.
