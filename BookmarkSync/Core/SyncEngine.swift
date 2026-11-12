@@ -19,6 +19,11 @@ class SyncEngine {
     init(modelContext: ModelContext, viewModel: AppViewModel) {
         self.modelContext = modelContext
         self.viewModel = viewModel
+        WriteQueue.shared.onWriteConflict = { [weak self] filePath, _ in
+            Task { @MainActor [weak self] in
+                self?.triggerSync(changedPaths: [filePath.path], forceImmediate: true)
+            }
+        }
     }
     
     func triggerSync(changedPaths: [String], forceImmediate: Bool = false) {
@@ -28,7 +33,7 @@ class SyncEngine {
         
         let now = Date()
         let filteredPaths = changedPaths.filter { path in
-            if let lastWrite = WriteQueue.lastWriteTimes[path], now.timeIntervalSince(lastWrite) < 5.0 {
+            if let lastWrite = WriteQueue.lastWriteTime(for: path), now.timeIntervalSince(lastWrite) < 5.0 {
                 SyncLog.verbose("Ignoring change on \(path) from our own write")
                 return false
             }

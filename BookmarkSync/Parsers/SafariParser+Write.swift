@@ -13,6 +13,11 @@ extension SafariParser {
     }
 
     func write(nodes: [ParsedBookmark]) throws {
+        _ = try writeWithReport(nodes: nodes)
+    }
+
+    @discardableResult
+    func writeWithReport(nodes: [ParsedBookmark]) throws -> SafariWriteReport {
         try performBackup()
         
         let strippedNodes = nodes.map { node in
@@ -105,31 +110,180 @@ extension SafariParser {
             }
         }
         
-        func buildTree(prefix: String, parentId: String?) -> [[String: Any]] {
+        let hasRootSync = (root["Sync"] as? [String: Any]) != nil
+        let cloudKitHelper = SafariCloudKitTreeHelper(rootChildren: rootChildren)
+        var originalRootPrefixByUuid: [String: String] = [:]
+        for (topoId, uuid) in originalMapByTopologicalId {
+            if let rootPrefix = topoId.split(separator: ":", maxSplits: 1).first {
+                originalRootPrefixByUuid[uuid] = String(rootPrefix)
+            }
+        }
+
+        func isCompatibleType(_ origDict: [String: Any], with nodeType: BookmarkType) -> Bool {
+            let expected = nodeType == .folder ? "WebBookmarkTypeList" : "WebBookmarkTypeLeaf"
+            return (origDict["WebBookmarkType"] as? String) == expected
+        }
+
+        // Pre-reserve every exact topological match upfront so moved/renamed
+        // items in earlier folders can never steal an unmoved sibling's UUID.
+        var topologicalMatchesByNodeId: [String: String] = [:]
+        var reservedTopologicalUuids: Set<String> = []
+        for node in strippedNodes {
+            if let candidate = originalMapByTopologicalId[node.id],
+               !reservedTopologicalUuids.contains(candidate),
+               let origDict = originalNodesByUuid[candidate],
+               isCompatibleType(origDict, with: node.type) {
+                topologicalMatchesByNodeId[node.id] = candidate
+                reservedTopologicalUuids.insert(candidate)
+            }
+        }
+
+        var needsCloudKitMigration = false
+        var preservedCount = 0
+        var invalidatedCount = 0
+        var createdCount = 0
+        var tombstonedCount = 0
+
+        func claimFallbackUuid(
+            for node: ParsedBookmark,
+            candidates: [String]
+        ) -> String? {
+            for candidate in candidates {
+                guard !usedUuids.contains(candidate),
+                      !reservedTopologicalUuids.contains(candidate),
+                      let origDict = originalNodesByUuid[candidate],
+                      isCompatibleType(origDict, with: node.type) else {
+                    continue
+                }
+                return candidate
+            }
+            return nil
+        }
+
+        func buildChildren(prefix: String, parentId: String?, parentUuid: String?) -> [[String: Any]] {
             let sortedChildren = childIndex.children(prefix: prefix, parentId: parentId)
-            return sortedChildren.map { node in
-                var uuid = originalMapByTopologicalId[node.id]
-                if uuid == nil {
-                    if let url = node.url {
-                        uuid = originalMapByUrl[normalizeURL(url)]
+
+            struct ClaimedSibling {
+                let node: ParsedBookmark
+                let uuid: String
+                let origDict: [String: Any]?
+                let sameParent: Bool
+            }
+
+            var claimed: [ClaimedSibling] = []
+            claimed.reserveCapacity(sortedChildren.count)
+
+            for node in sortedChildren {
+                var matchedUuid: String?
+                if let topoUuid = topologicalMatchesByNodeId[node.id], !usedUuids.contains(topoUuid) {
+                    matchedUuid = topoUuid
+                } else if node.type == .leaf, let url = node.url {
+                    let candidates = cloudKitHelper.urlQueues[normalizeURL(url)] ?? []
+                    let titlePreferred = candidates.filter {
+                        (originalNodesByUuid[$0]?["Title"] as? String) == node.title
+                    }
+                    matchedUuid = claimFallbackUuid(for: node, candidates: titlePreferred + candidates)
+                    if matchedUuid == nil, let fallback = originalMapByUrl[normalizeURL(url)] {
+                        matchedUuid = claimFallbackUuid(for: node, candidates: [fallback])
+                    }
+                } else if node.type == .folder {
+                    let named = (originalMapByName[node.title] ?? []) + (cloudKitHelper.folderQueues[node.title] ?? [])
+                    let parentPreferred = named.filter { parentUuidMap[$0] == parentUuid }
+                    matchedUuid = claimFallbackUuid(for: node, candidates: parentPreferred + named)
+                }
+
+                if let uuid = matchedUuid, let origDict = originalNodesByUuid[uuid] {
+                    usedUuids.insert(uuid)
+                    let sameParent: Bool
+                    if let targetParentUuid = parentUuid {
+                        sameParent = (parentUuidMap[uuid] == targetParentUuid)
                     } else {
-                        if var origs = originalMapByName[node.title], !origs.isEmpty {
-                            uuid = origs.removeFirst()
-                            originalMapByName[node.title] = origs
+                        sameParent = (parentUuidMap[uuid] == nil && originalRootPrefixByUuid[uuid] == prefix)
+                    }
+                    claimed.append(ClaimedSibling(node: node, uuid: uuid, origDict: origDict, sameParent: sameParent))
+                } else {
+                    let freshUuid = newUuid()
+                    usedUuids.insert(freshUuid)
+                    claimed.append(ClaimedSibling(node: node, uuid: freshUuid, origDict: nil, sameParent: false))
+                }
+            }
+
+            var sameParentEntries: [(siblingIndex: Int, orderValue: Int)] = []
+            for (idx, item) in claimed.enumerated() where item.sameParent {
+                let orderValue = cloudKitHelper.orderByUuid[item.uuid] ?? idx
+                sameParentEntries.append((siblingIndex: idx, orderValue: orderValue))
+            }
+            let anchoredOffsets = SafariCloudKitTreeHelper.longestIncreasingSubsequenceIndices(sameParentEntries.map(\.orderValue))
+            var reorderedSiblingIndices = Set<Int>()
+            for (offset, entry) in sameParentEntries.enumerated() where !anchoredOffsets.contains(offset) {
+                reorderedSiblingIndices.insert(entry.siblingIndex)
+            }
+
+            return claimed.enumerated().map { idx, item in
+                let node = item.node
+                let childDicts: [[String: Any]]? = node.type == .folder
+                    ? buildChildren(prefix: prefix, parentId: node.id, parentUuid: item.uuid)
+                    : nil
+
+                if var existing = item.origDict {
+                    let sameType = isCompatibleType(existing, with: node.type)
+                    let origTitle = existing["Title"] as? String ?? ""
+                    let sameTitle = origTitle == node.title
+                    let sameURL: Bool = {
+                        guard node.type == .leaf else { return true }
+                        return (existing["URLString"] as? String) == node.url
+                    }()
+                    let isSemanticallyUnchanged = sameType && item.sameParent && sameTitle && sameURL && !reorderedSiblingIndices.contains(idx)
+
+                    existing["WebBookmarkUUID"] = item.uuid
+                    existing["Title"] = node.title
+                    if node.type == .folder {
+                        existing["WebBookmarkType"] = "WebBookmarkTypeList"
+                        existing["Children"] = childDicts ?? []
+                    } else {
+                        existing["WebBookmarkType"] = "WebBookmarkTypeLeaf"
+                        if let url = node.url {
+                            existing["URLString"] = url
+                            var uriDict = (existing["URIDictionary"] as? [String: Any]) ?? [:]
+                            uriDict["title"] = node.title
+                            existing["URIDictionary"] = uriDict
+                        } else {
+                            existing.removeValue(forKey: "URLString")
                         }
                     }
+
+                    if hasRootSync {
+                        if isSemanticallyUnchanged {
+                            if SafariCloudKitTreeHelper.syncNeedsRepair(existing["Sync"]) {
+                                var syncDict = (existing["Sync"] as? [String: Any]) ?? [:]
+                                if (syncDict["ServerID"] as? String)?.isEmpty ?? true {
+                                    syncDict["ServerID"] = newUuid()
+                                }
+                                existing["Sync"] = syncDict
+                                needsCloudKitMigration = true
+                                invalidatedCount += 1
+                            } else {
+                                preservedCount += 1
+                            }
+                        } else {
+                            existing["Sync"] = SafariCloudKitTreeHelper.stripPositionData(
+                                in: existing["Sync"],
+                                serverIdFallback: newUuid
+                            )
+                            needsCloudKitMigration = true
+                            invalidatedCount += 1
+                        }
+                    }
+                    return existing
                 }
-                
-                let finalUuid = uuid ?? newUuid()
-                usedUuids.insert(finalUuid)
-                
+
                 var dict: [String: Any] = [
                     "Title": node.title,
-                    "WebBookmarkUUID": finalUuid
+                    "WebBookmarkUUID": item.uuid
                 ]
                 if node.type == .folder {
                     dict["WebBookmarkType"] = "WebBookmarkTypeList"
-                    dict["Children"] = buildTree(prefix: prefix, parentId: node.id)
+                    dict["Children"] = childDicts ?? []
                 } else {
                     dict["WebBookmarkType"] = "WebBookmarkTypeLeaf"
                     if let url = node.url {
@@ -137,8 +291,17 @@ extension SafariParser {
                         dict["URIDictionary"] = ["title": node.title]
                     }
                 }
+                if hasRootSync {
+                    dict["Sync"] = ["ServerID": newUuid()]
+                    needsCloudKitMigration = true
+                    createdCount += 1
+                }
                 return dict
             }
+        }
+
+        func buildTree(prefix: String, parentId: String?) -> [[String: Any]] {
+            buildChildren(prefix: prefix, parentId: parentId, parentUuid: nil)
         }
         
         let fBarChildren = buildTree(prefix: "bookmark_bar", parentId: nil)
@@ -155,7 +318,18 @@ extension SafariParser {
             if !usedUuids.contains(uuid) {
                 let pUuid = parentUuidMap[uuid]
                 if pUuid == nil || usedUuids.contains(pUuid!) {
-                    newlyDeleted.append(origDict)
+                    if let prepared = SafariCloudKitTreeHelper.prepareDeletedSubtree(
+                        in: origDict,
+                        usedUuids: usedUuids,
+                        stripSyncPayload: hasRootSync,
+                        assignMissingServerID: newUuid
+                    ) {
+                        newlyDeleted.append(prepared.dict)
+                        if hasRootSync {
+                            tombstonedCount += prepared.nodeCount
+                            needsCloudKitMigration = true
+                        }
+                    }
                 }
             }
         }
@@ -167,6 +341,14 @@ extension SafariParser {
                 "WebBookmarkUUID": newUuid(),
                 "Children": [[String: Any]]()
             ]
+            if hasRootSync {
+                var syncDict = (deletedFolder["Sync"] as? [String: Any]) ?? [:]
+                if (syncDict["ServerID"] as? String)?.isEmpty ?? true {
+                    syncDict["ServerID"] = newUuid()
+                    deletedFolder["Sync"] = syncDict
+                    needsCloudKitMigration = true
+                }
+            }
             var deletedChildren = deletedFolder["Children"] as? [[String: Any]] ?? []
             deletedChildren.append(contentsOf: newlyDeleted)
             deletedFolder["Children"] = deletedChildren
@@ -240,7 +422,19 @@ extension SafariParser {
         }
         
         root["Children"] = rootChildren
+        if hasRootSync, needsCloudKitMigration, var rootSync = root["Sync"] as? [String: Any] {
+            rootSync["CloudKitMigrationState"] = 0
+            root["Sync"] = rootSync
+        }
         let outData = try PropertyListSerialization.data(fromPropertyList: root, format: .binary, options: 0)
         try outData.write(to: filePath, options: .atomic)
+        return SafariWriteReport(
+            hasRootSync: hasRootSync,
+            didRequestCloudKitMigration: hasRootSync && needsCloudKitMigration,
+            preservedCount: preservedCount,
+            invalidatedCount: invalidatedCount,
+            createdCount: createdCount,
+            tombstonedCount: tombstonedCount
+        )
     }
 }
